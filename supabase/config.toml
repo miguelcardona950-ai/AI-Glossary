@@ -1,0 +1,7 @@
+# Supabase CLI settings for this project. Only the parts this app uses.
+project_id = "ai-glossary"
+
+[functions.define-term]
+# Supabase checks for a valid token before the function runs. The function then
+# also checks that the token belongs to a signed-in user (see index.ts).
+verify_jwt = true

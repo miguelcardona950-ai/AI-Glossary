@@ -24,6 +24,7 @@ const state = {
 };
 
 let refreshView = null;  // redraws the current screen when terms finish loading
+let leaveScreen = null;  // cleanup for the current screen, run when you move to another one
 let renderedHash = null; // the address currently on screen
 let loading = null;      // the load in progress, so screens share one request
 let bootFailed = false;
@@ -43,6 +44,8 @@ const routes = [
 function route() {
   renderedHash = location.hash;
   refreshView = null;
+  leaveScreen?.();
+  leaveScreen = null;
   if (!state.session) return renderSignIn();
 
   for (const [pattern, render] of routes) {
@@ -268,11 +271,29 @@ function renderEdit(id) {
   termForm({ existing: term, draftKey: `draft:edit:${id}`, original: term });
 }
 
+// What to say when getting an AI definition fails. Your term is always kept,
+// and you can still type a definition yourself.
+const AI_MESSAGES = {
+  offline: 'You’re offline. Getting a definition and saving both need a connection.',
+  timeout: 'The AI took too long to answer. Try again, or type your own definition.',
+  unreachable: 'Couldn’t reach the definition service. Try again, or type your own definition.',
+  ai_unavailable: 'The AI service isn’t responding right now. Try again in a moment, or type your own definition.',
+  ai_busy: 'The AI is busy. Wait a minute and try again, or type your own definition.',
+  ai_empty: 'The AI didn’t return a usable definition, so nothing was filled in. Try again, or type your own.',
+  ai_unknown_term: 'The AI doesn’t recognise this as a software term. Check the spelling, or type your own definition.',
+  ai_no_credit: 'Your Anthropic account is out of credit. Add some at console.anthropic.com, or type your own definition.',
+  ai_setup: 'Automatic definitions aren’t set up yet (see “Automatic definitions” in the README). You can type your own.',
+};
+
 // The form for both adding and editing. `existing` is the term being edited, if any.
+// Only the add form has "Get definition".
 function termForm({ existing = null, draftKey, original }) {
   const draft = readDraft(draftKey);
   // A new term's id is made here so that saving twice can't create two terms (see db.addTerm).
   const newId = existing ? null : (draft?.id ?? crypto.randomUUID());
+  let aiSuggestion = draft?.aiSuggestion ?? null;         // the last definition the AI wrote, if any
+  let aiSuggestionTerm = draft?.aiSuggestionTerm ?? null; // ...and the term it was written for
+  let aiRequest = null;                                   // lets Cancel stop the request in progress
 
   const termInput = el('input', {
     id: 'term',
@@ -296,6 +317,15 @@ function termForm({ existing = null, draftKey, original }) {
   const status = el('div', { class: 'form-status' });
   const saveLabel = existing ? 'Save changes' : 'Save term';
   const saveButton = el('button', { type: 'submit', class: 'button button-primary' }, saveLabel);
+  const aiButton =
+    !existing &&
+    el(
+      'button',
+      { type: 'button', class: 'button button-secondary', onclick: getDefinition },
+      aiSuggestion ? 'Try again' : 'Get definition',
+    );
+  const aiStatus = el('div', { class: 'ai-status' });
+  const aiBadge = el('span', { class: 'ai-badge' }, 'Suggested by AI. Check it and edit if needed before saving.');
 
   // The return key in the Term field moves to Definition instead of submitting.
   termInput.addEventListener('keydown', (event) => {
@@ -310,8 +340,102 @@ function termForm({ existing = null, draftKey, original }) {
     const current = { term: termInput.value, definition: definitionInput.value };
     const unchanged = current.term === original.term && current.definition === original.definition;
     if (unchanged) clearDraft(draftKey);
-    else writeDraft(draftKey, { ...current, id: newId });
+    else writeDraft(draftKey, { ...current, id: newId, aiSuggestion, aiSuggestionTerm });
   }
+
+  // True while the Definition box still holds the AI's suggestion exactly as written.
+  function isUntouchedSuggestion() {
+    return Boolean(aiSuggestion) && definitionInput.value.trim() === aiSuggestion.trim();
+  }
+
+  function updateBadge() {
+    aiBadge.hidden = !(aiSuggestion && definitionInput.value.trim());
+    const termChanged = aiSuggestionTerm && aiSuggestionTerm !== termInput.value.trim();
+    aiBadge.textContent = termChanged
+      ? `Suggested by AI for “${aiSuggestionTerm}”. Check it fits this term before saving.`
+      : 'Suggested by AI. Check it and edit if needed before saving.';
+  }
+
+  async function getDefinition() {
+    const term = termInput.value.trim();
+    if (!term) {
+      aiStatus.replaceChildren(el('p', { class: 'field-error', role: 'alert' }, 'Type the term first.'));
+      termInput.focus();
+      return;
+    }
+    const isOwnWriting = definitionInput.value.trim() && !isUntouchedSuggestion();
+    if (isOwnWriting && !confirm('Replace the definition you’ve written with an AI suggestion?')) return;
+    // A suggestion written for a different term is cleared now, so if this request
+    // fails the box is empty rather than holding a definition of something else.
+    if (isUntouchedSuggestion() && aiSuggestionTerm !== term) {
+      definitionInput.value = '';
+      saveDraft();
+    }
+
+    const controller = new AbortController();
+    aiRequest = controller;
+    showWaiting(term);
+    try {
+      const definition = await db.defineTerm(term, controller.signal);
+      if (aiRequest !== controller || !definitionInput.isConnected) return; // cancelled, or you left the form
+      aiSuggestion = definition;
+      aiSuggestionTerm = term;
+      definitionInput.value = definition;
+      aiStatus.replaceChildren();
+      saveDraft();
+    } catch (error) {
+      if (aiRequest !== controller || error.kind === 'cancelled') return;
+      if (error.kind === 'auth') {
+        signedOut('Your sign-in expired. Please sign in again.'); // what you typed is kept as a draft
+        return;
+      }
+      aiStatus.replaceChildren(
+        el(
+          'div',
+          { class: 'notice notice-error notice-inline', role: 'alert' },
+          el('p', {}, el('strong', {}, 'Couldn’t get a definition')),
+          el('p', {}, AI_MESSAGES[error.kind] ?? error.message),
+        ),
+      );
+    } finally {
+      if (aiRequest === controller) stopWaiting();
+      updateBadge();
+    }
+  }
+
+  function showWaiting(term) {
+    termInput.readOnly = true;
+    definitionInput.readOnly = true;
+    saveButton.disabled = true;
+    aiButton.hidden = true;
+    aiStatus.replaceChildren(
+      el(
+        'div',
+        { class: 'ai-waiting', role: 'status' },
+        el('span', { class: 'spinner', 'aria-hidden': 'true' }),
+        el('p', {}, `Writing a definition for “${term}”…`),
+        el('button', { type: 'button', class: 'ai-cancel', onclick: cancelDefinition }, 'Cancel'),
+      ),
+    );
+  }
+
+  function stopWaiting() {
+    aiRequest = null;
+    termInput.readOnly = false;
+    definitionInput.readOnly = false;
+    saveButton.disabled = false;
+    aiButton.hidden = false;
+    aiButton.textContent = aiSuggestion ? 'Try again' : 'Get definition';
+  }
+
+  function cancelDefinition() {
+    aiRequest?.abort();
+    stopWaiting();
+    aiStatus.replaceChildren();
+  }
+
+  // Leaving the form (Back, a tab, signing out) stops a request still in progress.
+  leaveScreen = () => aiRequest?.abort();
 
   async function save(event) {
     event.preventDefault();
@@ -319,6 +443,12 @@ function termForm({ existing = null, draftKey, original }) {
     if (!fields.term) {
       status.replaceChildren(el('p', { class: 'field-error', role: 'alert' }, 'Enter the term first.'));
       termInput.focus();
+      return;
+    }
+    // A term is never saved without a definition.
+    if (!fields.definition) {
+      const hint = existing ? 'Add a definition first.' : 'Add a definition first: type one, or tap Get definition.';
+      status.replaceChildren(el('p', { class: 'field-error', role: 'alert' }, hint));
       return;
     }
 
@@ -373,13 +503,24 @@ function termForm({ existing = null, draftKey, original }) {
   view.append(
     el(
       'form',
-      { class: 'term-form', novalidate: true, onsubmit: save, oninput: saveDraft },
+      {
+        class: 'term-form',
+        novalidate: true,
+        onsubmit: save,
+        oninput: () => {
+          saveDraft();
+          updateBadge();
+        },
+      },
       restoredNotice,
       el('label', { class: 'field' }, el('span', { class: 'field-label' }, 'Term'), termInput),
+      aiButton,
+      aiStatus,
       el(
         'label',
         { class: 'field' },
-        el('span', { class: 'field-label' }, 'Definition ', el('span', { class: 'field-optional' }, '(optional)')),
+        el('span', { class: 'field-label' }, 'Definition'),
+        !existing && aiBadge,
         definitionInput,
       ),
       el('p', { class: 'field-hint' }, 'Wrap code in `backticks` to show it as code.'),
@@ -405,7 +546,10 @@ function termForm({ existing = null, draftKey, original }) {
     ),
   );
 
-  if (!existing) (termInput.value ? definitionInput : termInput).focus();
+  updateBadge();
+  // An empty Add form opens the keyboard on Term. A prefilled one doesn't,
+  // so "Get definition" stays in view.
+  if (!existing && !termInput.value) termInput.focus();
 }
 
 function renderSearch() {

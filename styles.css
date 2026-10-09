@@ -328,7 +328,6 @@ mark {
   font-weight: 600;
 }
 
-.field-optional { font-weight: 400; }
 
 /* 16px or larger, or iPhone Safari zooms in when you tap the field. */
 input,
@@ -398,6 +397,40 @@ textarea:focus {
   color: var(--accent);
   font: inherit;
   font-weight: 600;
+}
+
+/* ---------- AI definitions ---------- */
+
+.ai-status:empty { display: none; }
+
+.ai-waiting {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 6px 6px 16px;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  font-size: 15px;
+}
+
+.ai-waiting p { flex: 1; margin: 0; overflow-wrap: anywhere; }
+.ai-waiting .spinner { flex: none; }
+
+.ai-cancel {
+  min-height: 44px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--accent);
+  font: inherit;
+  font-weight: 600;
+}
+
+.ai-badge {
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 500;
 }
 
 .intro {

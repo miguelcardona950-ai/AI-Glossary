@@ -66,3 +66,11 @@ drop policy if exists "Delete own terms" on public.terms;
 create policy "Delete own terms" on public.terms
   for delete to authenticated
   using ((select auth.uid()) = user_id);
+
+
+-- A definition is required: new and edited terms can't be saved with a blank one.
+-- "not valid" means terms saved before this rule existed aren't checked
+-- (until you edit them, when they'll need a definition too).
+alter table public.terms drop constraint if exists terms_definition_not_blank;
+alter table public.terms add constraint terms_definition_not_blank
+  check (char_length(btrim(definition)) > 0) not valid;

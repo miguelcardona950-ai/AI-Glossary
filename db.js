@@ -12,12 +12,28 @@
 //   invalid      the request was rejected (wrong password, term too long, ...)
 //   notfound     the term doesn't exist any more
 //   unknown      anything else
+//
+// Getting an AI definition (defineTerm) can also fail with:
+//
+//   cancelled        you tapped Cancel
+//   ai_unavailable   the AI service is down or unreachable
+//   ai_busy          the AI service is rate-limiting requests
+//   ai_empty         the answer was empty, cut off or otherwise unusable
+//   ai_unknown_term  the AI didn't recognise the term
+//   ai_no_credit     the Anthropic account is out of credit
+//   ai_setup         the function isn't deployed, or its API key is missing
 
-import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/+esm';
+import {
+  createClient,
+  FunctionsFetchError,
+  FunctionsHttpError,
+  FunctionsRelayError,
+} from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/+esm';
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
 
 const REQUEST_TIMEOUT_MS = 10_000; // give up on a single request after this long
 const DEADLINE_MS = 12_000;        // ...and on a whole operation, including refreshing the sign-in
+const AI_TIMEOUT_MS = 30_000;      // writing a definition takes longer than reading the database
 const PAGE_SIZE = 1000;            // Supabase returns at most 1000 rows per request
 const AUTH_STORAGE_KEY = 'glossary-auth';
 const COLUMNS = 'id, term, definition, created_at, updated_at';
@@ -35,17 +51,20 @@ let lastConnectionFailureAt = 0; // when a request last failed outright (no answ
 
 // fetch() that gives up instead of hanging on a bad connection.
 function fetchWithTimeout(resource, options = {}) {
+  const isFunctionCall = String(resource).includes('/functions/v1/');
   const controller = new AbortController();
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
-  }, REQUEST_TIMEOUT_MS);
+  }, isFunctionCall ? AI_TIMEOUT_MS : REQUEST_TIMEOUT_MS);
+  if (options.signal?.aborted) controller.abort();
   options.signal?.addEventListener('abort', () => controller.abort());
 
   return fetch(resource, { ...options, signal: controller.signal })
     .catch((error) => {
       if (timedOut) throw new Error(TIMEOUT_MESSAGE);
+      if (options.signal?.aborted) throw error; // cancelled on purpose, not a connection problem
       lastConnectionFailureAt = Date.now();
       throw error;
     })
@@ -84,12 +103,14 @@ function classify(error, status) {
     return new DbError('auth', 'Your sign-in has expired.');
   }
   if (code === 'PGRST116') return new DbError('notfound', 'That term no longer exists.');
-  if (code === '23514') return new DbError('invalid', 'The term must be 1–200 characters, and the definition under 20,000.');
+  if (code === '23514') {
+    return new DbError('invalid', 'A term needs a name (up to 200 characters) and a definition (under 20,000).');
+  }
   return new DbError('unknown', message);
 }
 
 // Runs one operation with an overall time limit, turning any failure into a DbError.
-async function attempt(operation) {
+async function attempt(operation, deadlineMs = DEADLINE_MS) {
   // Don't even try when the phone says it's offline: the answer is immediate,
   // instead of waiting out the timeouts.
   if (navigator.onLine === false) throw new DbError('offline', 'This device is offline.');
@@ -105,7 +126,7 @@ async function attempt(operation) {
           ? new DbError(navigator.onLine === false ? 'offline' : 'unreachable', 'Could not reach the database.')
           : new DbError('timeout', 'The database took too long to answer.'),
       );
-    }, DEADLINE_MS);
+    }, deadlineMs);
   });
   try {
     return await Promise.race([operation(), deadline]);
@@ -158,6 +179,62 @@ export function updateTerm(id, { term, definition }) {
 
 export function deleteTerm(id) {
   return attempt(() => rows(supabase.from('terms').delete().eq('id', id)));
+}
+
+// ---------- AI definitions ----------
+
+// What each error code from the define-term function means here.
+const AI_ERRORS = {
+  invalid_term: ['invalid', 'Enter a term first (up to 200 characters).'],
+  not_signed_in: ['auth', 'Your sign-in has expired.'],
+  ai_no_credit: ['ai_no_credit', 'The Anthropic account is out of credit.'],
+  empty_definition: ['ai_empty', 'The AI didn’t return a usable definition.'],
+  unknown_term: ['ai_unknown_term', 'The AI didn’t recognise this term.'],
+  ai_busy: ['ai_busy', 'The AI is busy.'],
+  not_configured: ['ai_setup', 'The definition service has no API key yet.'],
+  ai_unavailable: ['ai_unavailable', 'The AI service isn’t responding.'],
+  ai_timeout: ['timeout', 'The AI took too long to answer.'],
+};
+
+// Asks the define-term Edge Function to write a definition. Nothing is saved:
+// the add form shows it to you to check and edit first. `signal` makes Cancel work.
+export function defineTerm(term, signal) {
+  return attempt(async () => {
+    const { data, error } = await supabase.functions.invoke('define-term', { body: { term }, signal });
+    if (signal?.aborted) throw new DbError('cancelled', 'Cancelled.');
+    if (error) throw await classifyFunctionError(error);
+
+    const definition = typeof data?.definition === 'string' ? data.definition.trim() : '';
+    if (!definition) throw new DbError('ai_empty', 'The AI didn’t return a usable definition.');
+    return definition;
+  }, AI_TIMEOUT_MS + 2_000);
+}
+
+async function classifyFunctionError(error) {
+  if (error instanceof FunctionsHttpError) {
+    const response = error.context;
+    let code = '';
+    try {
+      code = (await response.json())?.error ?? '';
+    } catch {
+      // Not JSON: an error from Supabase itself rather than from the function.
+    }
+    if (AI_ERRORS[code]) return new DbError(...AI_ERRORS[code]);
+    if (response.status === 401) return new DbError('auth', 'Your sign-in has expired.');
+    if (response.status === 404) return new DbError('ai_setup', 'The define-term function isn’t deployed.');
+    return new DbError('ai_unavailable', `The definition service answered with an error (${response.status}).`);
+  }
+  if (error instanceof FunctionsRelayError) {
+    return new DbError('ai_unavailable', 'Supabase couldn’t run the definition service.');
+  }
+  if (error instanceof FunctionsFetchError) {
+    if (String(error.context?.message ?? '').includes(TIMEOUT_MESSAGE)) {
+      return new DbError('timeout', 'The AI took too long to answer.');
+    }
+    const kind = navigator.onLine === false ? 'offline' : 'unreachable';
+    return new DbError(kind, 'Could not reach the definition service.');
+  }
+  return classify(error);
 }
 
 // ---------- Signing in ----------

@@ -35,6 +35,56 @@ Open that address in Safari → **Share** → **Add to Home Screen**.
 
 To update the live app later, commit your changes and `git push`. GitHub Pages republishes by itself.
 
+## Automatic definitions
+
+On the Add screen, type a term and tap **Get definition**. A Supabase Edge Function asks Claude for a
+short, plain-language definition and shows it in the Definition box. You can edit it, tap **Try again**,
+or ignore it and type your own. Nothing is saved until you tap **Save term**.
+
+```
+Add form ──(your sign-in + the term)──▶ Edge Function "define-term" ──(API key)──▶ Claude
+```
+
+The Anthropic API key is stored only in the function's secrets on Supabase. It is never in the app,
+this repository or the browser. The function only answers signed-in users; the public anon key on
+its own is rejected, so nobody else can spend your API credit.
+
+It uses Claude Opus 5.5 at low effort, at roughly half a cent per definition. If Claude's safety filter
+declines a term (security terms occasionally trip it), Anthropic automatically retries it on another model.
+
+### Setting it up
+
+1. **API key:** at console.anthropic.com → **API Keys**, create a key and add some credit. Also set
+   a monthly **spend limit** there as a safety net.
+2. **Store the key in Supabase:** your project → **Edge Functions** → **Secrets** → add
+   `ANTHROPIC_API_KEY` with the key as its value.
+3. **Deploy the function** with the Supabase CLI (installed at `~/.local/bin/supabase`). Log in once:
+
+   ```bash
+   ~/.local/bin/supabase login
+   ```
+
+   Then, from this folder, deploy (again after any change to the function):
+
+   ```bash
+   ~/.local/bin/supabase functions deploy define-term --project-ref oshocrmspwfsmvxpampo --use-api
+   ```
+
+The function's code is [`supabase/functions/define-term/index.ts`](supabase/functions/define-term/index.ts).
+Deploying it to Supabase is separate from pushing the app to GitHub Pages.
+
+### When it fails
+
+Your term is always kept, and you can always type your own definition instead.
+
+- **AI service down, or busy:** a message saying so, with the button ready to try again.
+- **Slow:** "Writing a definition…" with a **Cancel** button. After about 30 seconds it gives up.
+- **Empty or broken answer:** nothing is put in the Definition box, and a message says so. An answer
+  that was cut off, declined, or implausibly long counts as broken.
+- **Term not recognised:** a message suggesting you check the spelling.
+
+A term can never be saved without a definition: the form checks, and so does the database.
+
 ## What's where
 
 | File | What it does |
@@ -47,6 +97,8 @@ To update the live app later, commit your changes and `git push`. GitHub Pages r
 | `sw.js` | Service worker: saves a copy of the app so it opens with no signal |
 | `manifest.webmanifest` | Name, icon and full-screen setting for the home screen |
 | `schema.sql` | The database table and its security rules |
+| `supabase/functions/define-term/index.ts` | The Edge Function that asks Claude for a definition |
+| `supabase/config.toml` | Supabase CLI settings for the function |
 | `icons/` | The app icon |
 | `.nojekyll` | Empty on purpose: tells GitHub Pages to serve the files as they are |
 | `.gitignore` | Files git should leave out of the repository |
@@ -60,7 +112,7 @@ One table, `public.terms`:
 | `id` | uuid | Primary key. Made by the app, so saving twice can't create a duplicate |
 | `user_id` | uuid | Your account. Filled in automatically from whoever is signed in |
 | `term` | text | Required, 1–200 characters |
-| `definition` | text | Optional (empty by default), up to 20,000 characters |
+| `definition` | text | Required (the database rejects a blank one), up to 20,000 characters |
 | `created_at` | timestamptz | When you added it. The list is sorted by this |
 | `updated_at` | timestamptz | Updated automatically by a trigger whenever you edit |
 
